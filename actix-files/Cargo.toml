@@ -23,6 +23,7 @@ actix-http = "1.0.1"
 actix-service = "1.0.1"
 bitflags = "1"
 bytes = "0.5.3"
+filesystem = { git = "https://github.com/aidanhs/filesystem-rs.git", rev = "3aafbbc" }
 futures = "0.3.1"
 derive_more = "0.99.2"
 log = "0.4"

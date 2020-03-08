@@ -1,4 +1,4 @@
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use actix_web::{Error, HttpMessage, HttpRequest, HttpResponse, Responder};
 use futures::future::{ready, Ready};
 
 use crate::range::HttpRange;
-use crate::ChunkedReadFile;
+use crate::{ChunkedReadFile, ReadSeek};
 
 bitflags! {
     pub(crate) struct Flags: u8 {
@@ -37,13 +37,19 @@ impl Default for Flags {
     }
 }
 
+#[derive(Debug)]
+pub struct NamedFileMetadata {
+    pub ino: Option<u64>,
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+}
+
 /// A file with an associated name.
 #[derive(Debug)]
-pub struct NamedFile {
+pub struct NamedFile<RS> {
     path: PathBuf,
-    file: File,
-    modified: Option<SystemTime>,
-    pub(crate) md: Metadata,
+    file: RS,
+    pub(crate) md: NamedFileMetadata,
     pub(crate) flags: Flags,
     pub(crate) status_code: StatusCode,
     pub(crate) content_type: mime::Mime,
@@ -51,7 +57,7 @@ pub struct NamedFile {
     pub(crate) encoding: Option<ContentEncoding>,
 }
 
-impl NamedFile {
+impl<RS> NamedFile<RS> {
     /// Creates an instance from a previously opened file.
     ///
     /// The given `path` need not exist and is only used to determine the `ContentType` and
@@ -73,7 +79,7 @@ impl NamedFile {
     ///     Ok(())
     /// }
     /// ```
-    pub fn from_file<P: AsRef<Path>>(file: File, path: P) -> io::Result<NamedFile> {
+    pub fn from_readseek<P: AsRef<Path>>(file: RS, path: P, md: NamedFileMetadata) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
 
         // Get the name of the file and use it to construct default Content-Type
@@ -110,8 +116,6 @@ impl NamedFile {
             (ct, cd)
         };
 
-        let md = file.metadata()?;
-        let modified = md.modified().ok();
         let encoding = None;
         Ok(NamedFile {
             path,
@@ -119,13 +123,14 @@ impl NamedFile {
             content_type,
             content_disposition,
             md,
-            modified,
             encoding,
             status_code: StatusCode::OK,
             flags: Flags::default(),
         })
     }
+}
 
+impl NamedFile<File> {
     /// Attempts to open a file in read-only mode.
     ///
     /// # Examples
@@ -135,8 +140,25 @@ impl NamedFile {
     ///
     /// let file = NamedFile::open("foo.txt");
     /// ```
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<NamedFile> {
-        Self::from_file(File::open(&path)?, path)
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::open(&path)?;
+        let metadata = file.metadata()?;
+        let ino = {
+            #[cfg(unix)]
+            {
+                Some(metadata.ino())
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        };
+        let md = NamedFileMetadata {
+            ino,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        };
+        Self::from_readseek(file, path, md)
     }
 
     /// Returns reference to the underlying `File` object.
@@ -144,7 +166,9 @@ impl NamedFile {
     pub fn file(&self) -> &File {
         &self.file
     }
+}
 
+impl<RS: ReadSeek> NamedFile<RS> {
     /// Retrieve the path of this file.
     ///
     /// # Examples
@@ -228,25 +252,14 @@ impl NamedFile {
 
     pub(crate) fn etag(&self) -> Option<header::EntityTag> {
         // This etag format is similar to Apache's.
-        self.modified.as_ref().map(|mtime| {
-            let ino = {
-                #[cfg(unix)]
-                {
-                    self.md.ino()
-                }
-                #[cfg(not(unix))]
-                {
-                    0
-                }
-            };
-
+        self.md.modified.as_ref().map(|mtime| {
             let dur = mtime
                 .duration_since(UNIX_EPOCH)
                 .expect("modification time must be after epoch");
             header::EntityTag::strong(format!(
                 "{:x}:{:x}:{:x}:{:x}",
-                ino,
-                self.md.len(),
+                self.md.ino.unwrap_or(0),
+                self.md.len,
                 dur.as_secs(),
                 dur.subsec_nanos()
             ))
@@ -254,7 +267,7 @@ impl NamedFile {
     }
 
     pub(crate) fn last_modified(&self) -> Option<header::HttpDate> {
-        self.modified.map(|mtime| mtime.into())
+        self.md.modified.map(|mtime| mtime.into())
     }
 
     pub fn into_response(self, req: &HttpRequest) -> Result<HttpResponse, Error> {
@@ -271,7 +284,7 @@ impl NamedFile {
                 resp.encoding(current_encoding);
             }
             let reader = ChunkedReadFile {
-                size: self.md.len(),
+                size: self.md.len,
                 offset: 0,
                 file: Some(self.file),
                 fut: None,
@@ -347,7 +360,7 @@ impl NamedFile {
 
         resp.header(header::ACCEPT_RANGES, "bytes");
 
-        let mut length = self.md.len();
+        let mut length = self.md.len;
         let mut offset = 0;
 
         // check for range header
@@ -363,7 +376,7 @@ impl NamedFile {
                             "bytes {}-{}/{}",
                             offset,
                             offset + length - 1,
-                            self.md.len()
+                            self.md.len
                         ),
                     );
                 } else {
@@ -388,7 +401,7 @@ impl NamedFile {
             fut: None,
             counter: 0,
         };
-        if offset != 0 || length != self.md.len() {
+        if offset != 0 || length != self.md.len {
             Ok(resp.status(StatusCode::PARTIAL_CONTENT).streaming(reader))
         } else {
             Ok(resp.body(SizedStream::new(length, reader)))
@@ -396,16 +409,16 @@ impl NamedFile {
     }
 }
 
-impl Deref for NamedFile {
-    type Target = File;
+impl<RS> Deref for NamedFile<RS> {
+    type Target = RS;
 
-    fn deref(&self) -> &File {
+    fn deref(&self) -> &RS {
         &self.file
     }
 }
 
-impl DerefMut for NamedFile {
-    fn deref_mut(&mut self) -> &mut File {
+impl<RS> DerefMut for NamedFile<RS> {
+    fn deref_mut(&mut self) -> &mut RS {
         &mut self.file
     }
 }
@@ -445,7 +458,7 @@ fn none_match(etag: Option<&header::EntityTag>, req: &HttpRequest) -> bool {
     }
 }
 
-impl Responder for NamedFile {
+impl<RS: ReadSeek> Responder for NamedFile<RS> {
     type Error = Error;
     type Future = Ready<Result<HttpResponse, Error>>;
 

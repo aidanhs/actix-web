@@ -3,7 +3,7 @@
 //! Static files support
 use std::cell::RefCell;
 use std::fmt::Write;
-use std::fs::{DirEntry, File};
+use std::fs;
 use std::future::Future;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
@@ -24,6 +24,7 @@ use actix_web::http::header::{self, DispositionType};
 use actix_web::http::Method;
 use actix_web::{web, FromRequest, HttpRequest, HttpResponse};
 use bytes::Bytes;
+use filesystem::FileSystem;
 use futures::future::{ok, ready, Either, FutureExt, LocalBoxFuture, Ready};
 use futures::Stream;
 use mime;
@@ -36,8 +37,11 @@ mod named;
 mod range;
 
 use self::error::{FilesError, UriSegmentError};
-pub use crate::named::NamedFile;
+pub use crate::named::{NamedFile, NamedFileMetadata};
 pub use crate::range::HttpRange;
+
+pub trait ReadSeek: Read + Seek + Sized + Send + Unpin + 'static {}
+impl<T: Read + Seek + Sized + Send + Unpin + 'static> ReadSeek for T {}
 
 type HttpService = BoxService<ServiceRequest, ServiceResponse, Error>;
 type HttpNewService = BoxServiceFactory<(), ServiceRequest, ServiceResponse, Error, ()>;
@@ -57,18 +61,18 @@ fn handle_error(err: BlockingError<io::Error>) -> Error {
     }
 }
 #[doc(hidden)]
-/// A helper created from a `std::fs::File` which reads the file
+/// A helper created from a `ReadSeek` which reads the item
 /// chunk-by-chunk on a `ThreadPool`.
-pub struct ChunkedReadFile {
+pub struct ChunkedReadFile<RS> {
     size: u64,
     offset: u64,
-    file: Option<File>,
+    file: Option<RS>,
     fut:
-        Option<LocalBoxFuture<'static, Result<(File, Bytes), BlockingError<io::Error>>>>,
+        Option<LocalBoxFuture<'static, Result<(RS, Bytes), BlockingError<io::Error>>>>,
     counter: u64,
 }
 
-impl Stream for ChunkedReadFile {
+impl<RS: ReadSeek> Stream for ChunkedReadFile<RS> {
     type Item = Result<Bytes, Error>;
 
     fn poll_next(
@@ -117,34 +121,32 @@ impl Stream for ChunkedReadFile {
     }
 }
 
-type DirectoryRenderer =
-    dyn Fn(&Directory, &HttpRequest) -> Result<ServiceResponse, io::Error>;
+type DirectoryRenderer<FS> =
+    dyn Fn(&FS, &Directory, &HttpRequest) -> Result<ServiceResponse, io::Error>;
 
 /// A directory; responds with the generated directory listing.
 #[derive(Debug)]
 pub struct Directory {
-    /// Base directory
-    pub base: PathBuf,
     /// Path of subdirectory to generate listing for
     pub path: PathBuf,
 }
 
 impl Directory {
     /// Create a new directory
-    pub fn new(base: PathBuf, path: PathBuf) -> Directory {
-        Directory { base, path }
+    pub fn new(path: PathBuf) -> Directory {
+        Directory { path }
     }
 
     /// Is this entry visible from this directory?
-    pub fn is_visible(&self, entry: &io::Result<DirEntry>) -> bool {
+    pub fn is_visible(&self, entry: &io::Result<impl filesystem::DirEntry>) -> bool {
         if let Ok(ref entry) = *entry {
             if let Some(name) = entry.file_name().to_str() {
                 if name.starts_with('.') {
                     return false;
                 }
             }
-            if let Ok(ref md) = entry.metadata() {
-                let ft = md.file_type();
+            if let Ok(ft) = entry.file_type() {
+                use filesystem::FileType;
                 return ft.is_dir() || ft.is_file() || ft.is_symlink();
             }
         }
@@ -166,7 +168,8 @@ macro_rules! encode_file_name {
     };
 }
 
-fn directory_listing(
+fn directory_listing<FS: FileSystem<DirEntry=DE, ReadDir=RD>, DE: filesystem::DirEntry, RD: filesystem::ReadDir<DE>>(
+    fs: &FS,
     dir: &Directory,
     req: &HttpRequest,
 ) -> Result<ServiceResponse, io::Error> {
@@ -174,7 +177,7 @@ fn directory_listing(
     let mut body = String::new();
     let base = Path::new(req.path());
 
-    for entry in dir.path.read_dir()? {
+    for entry in fs.read_dir(&dir.path)? {
         if dir.is_visible(&entry) {
             let entry = entry.unwrap();
             let p = match entry.path().strip_prefix(&dir.path) {
@@ -186,8 +189,9 @@ fn directory_listing(
             };
 
             // if file is a directory, add '/' to the end of the name
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_dir() {
+            if let Ok(file_type) = entry.file_type() {
+                use filesystem::FileType;
+                if file_type.is_dir() {
                     let _ = write!(
                         body,
                         "<li><a href=\"{}\">{}/</a></li>",
@@ -227,6 +231,8 @@ fn directory_listing(
 
 type MimeOverride = dyn Fn(&mime::Name) -> DispositionType;
 
+type NamedFileOpenFn<FS, RS> = fn(&FS, &Path) -> io::Result<NamedFile<RS>>;
+
 /// Static files handling
 ///
 /// `Files` service must be registered with `App::service()` method.
@@ -240,60 +246,81 @@ type MimeOverride = dyn Fn(&mime::Name) -> DispositionType;
 ///         .service(fs::Files::new("/static", "."));
 /// }
 /// ```
-pub struct Files {
+pub struct Files<FS, RS> {
     path: String,
     directory: PathBuf,
+    filesystem: FS,
+    namedfile_open: NamedFileOpenFn<FS, RS>,
     index: Option<String>,
     show_index: bool,
     redirect_to_slash: bool,
     default: Rc<RefCell<Option<Rc<HttpNewService>>>>,
-    renderer: Rc<DirectoryRenderer>,
+    renderer: Rc<DirectoryRenderer<FS>>,
     mime_override: Option<Rc<MimeOverride>>,
     file_flags: named::Flags,
     guards: Option<Rc<Box<dyn Guard>>>,
 }
 
-impl Clone for Files {
+impl<FS: Clone, RS> Clone for Files<FS, RS> {
     fn clone(&self) -> Self {
         Self {
+            path: self.path.clone(),
             directory: self.directory.clone(),
+            filesystem: self.filesystem.clone(),
+            namedfile_open: self.namedfile_open,
             index: self.index.clone(),
             show_index: self.show_index,
             redirect_to_slash: self.redirect_to_slash,
             default: self.default.clone(),
             renderer: self.renderer.clone(),
             file_flags: self.file_flags,
-            path: self.path.clone(),
             mime_override: self.mime_override.clone(),
             guards: self.guards.clone(),
         }
     }
 }
 
-impl Files {
+impl Files<filesystem::OsFileSystem, fs::File> {
     /// Create new `Files` instance for specified base directory.
     ///
     /// `File` uses `ThreadPool` for blocking filesystem operations.
     /// By default pool with 5x threads of available cpus is used.
     /// Pool size can be changed by setting ACTIX_CPU_POOL environment variable.
-    pub fn new<T: Into<PathBuf>>(path: &str, dir: T) -> Files {
-        let orig_dir = dir.into();
-        let dir = match orig_dir.canonicalize() {
-            Ok(canon_dir) => canon_dir,
-            Err(_) => {
-                log::error!("Specified path is not a directory: {:?}", orig_dir);
-                PathBuf::new()
-            }
-        };
+    pub fn new<T: Into<PathBuf>>(path: &str, dir: T) -> Self {
+        let mut dir = dir.into();
+        if !dir.is_dir() {
+            log::error!("Specified path is not a directory: {}", dir.display());
+            dir = PathBuf::new()
+        }
 
+        Self::new_with_filesystem_and_namedfile_open_and_renderer(
+            filesystem::OsFileSystem::new(),
+            |_, p| NamedFile::open(p),
+            Rc::new(directory_listing),
+            path,
+            dir,
+        )
+    }
+}
+
+impl<FS, RS> Files<FS, RS> {
+    pub fn new_with_filesystem_and_namedfile_open_and_renderer(
+        fs: FS,
+        namedfile_open: NamedFileOpenFn<FS, RS>,
+        directory_renderer: Rc<DirectoryRenderer<FS>>,
+        path: &str,
+        abs_dir: PathBuf
+    ) -> Self {
         Files {
             path: path.to_string(),
-            directory: dir,
+            directory: abs_dir,
+            filesystem: fs,
+            namedfile_open,
             index: None,
             show_index: false,
             redirect_to_slash: false,
             default: Rc::new(RefCell::new(None)),
-            renderer: Rc::new(directory_listing),
+            renderer: directory_renderer,
             mime_override: None,
             file_flags: named::Flags::default(),
             guards: None,
@@ -319,7 +346,7 @@ impl Files {
     /// Set custom directory renderer
     pub fn files_listing_renderer<F>(mut self, f: F) -> Self
     where
-        for<'r, 's> F: Fn(&'r Directory, &'s HttpRequest) -> Result<ServiceResponse, io::Error>
+        for<'r, 's, 't> F: Fn(&'r FS, &'s Directory, &'t HttpRequest) -> Result<ServiceResponse, io::Error>
             + 'static,
     {
         self.renderer = Rc::new(f);
@@ -400,7 +427,7 @@ impl Files {
     }
 }
 
-impl HttpServiceFactory for Files {
+impl<FS: FileSystem + Clone + 'static, RS: ReadSeek> HttpServiceFactory for Files<FS, RS> {
     fn register(self, config: &mut AppService) {
         if self.default.borrow().is_none() {
             *self.default.borrow_mut() = Some(config.default_service());
@@ -414,18 +441,20 @@ impl HttpServiceFactory for Files {
     }
 }
 
-impl ServiceFactory for Files {
+impl<FS: FileSystem + Clone + 'static, RS: ReadSeek> ServiceFactory for Files<FS, RS> {
     type Request = ServiceRequest;
     type Response = ServiceResponse;
     type Error = Error;
     type Config = ();
-    type Service = FilesService;
+    type Service = FilesService<FS, RS>;
     type InitError = ();
     type Future = LocalBoxFuture<'static, Result<Self::Service, Self::InitError>>;
 
     fn new_service(&self, _: ()) -> Self::Future {
         let mut srv = FilesService {
             directory: self.directory.clone(),
+            filesystem: self.filesystem.clone(),
+            namedfile_open: self.namedfile_open,
             index: self.index.clone(),
             show_index: self.show_index,
             redirect_to_slash: self.redirect_to_slash,
@@ -453,19 +482,21 @@ impl ServiceFactory for Files {
     }
 }
 
-pub struct FilesService {
+pub struct FilesService<FS, RS> {
     directory: PathBuf,
+    filesystem: FS,
+    namedfile_open: NamedFileOpenFn<FS, RS>,
     index: Option<String>,
     show_index: bool,
     redirect_to_slash: bool,
     default: Option<HttpService>,
-    renderer: Rc<DirectoryRenderer>,
+    renderer: Rc<DirectoryRenderer<FS>>,
     mime_override: Option<Rc<MimeOverride>>,
     file_flags: named::Flags,
     guards: Option<Rc<Box<dyn Guard>>>,
 }
 
-impl FilesService {
+impl<FS, RS> FilesService<FS, RS> {
     fn handle_err(
         &mut self,
         e: io::Error,
@@ -483,7 +514,7 @@ impl FilesService {
     }
 }
 
-impl Service for FilesService {
+impl<FS: FileSystem, RS: ReadSeek> Service for FilesService<FS, RS> {
     type Request = ServiceRequest;
     type Response = ServiceResponse;
     type Error = Error;
@@ -522,12 +553,12 @@ impl Service for FilesService {
         };
 
         // full filepath
-        let path = match self.directory.join(&real_path.0).canonicalize() {
-            Ok(path) => path,
-            Err(e) => return self.handle_err(e, req),
-        };
+        let path = self.directory.join(&real_path.0);
+        if !self.filesystem.is_dir(&path) && !self.filesystem.is_file(&path) {
+            return self.handle_err(io::Error::new(io::ErrorKind::NotFound, "path not directory or file"), req)
+        }
 
-        if path.is_dir() {
+        if self.filesystem.is_dir(&path) {
             if let Some(ref redir_index) = self.index {
                 if self.redirect_to_slash && !req.path().ends_with('/') {
                     let redirect_to = format!("{}/", req.path());
@@ -541,7 +572,7 @@ impl Service for FilesService {
 
                 let path = path.join(redir_index);
 
-                match NamedFile::open(path) {
+                match (self.namedfile_open)(&self.filesystem, &path) {
                     Ok(mut named_file) => {
                         if let Some(ref mime_override) = self.mime_override {
                             let new_disposition =
@@ -559,9 +590,9 @@ impl Service for FilesService {
                     Err(e) => self.handle_err(e, req),
                 }
             } else if self.show_index {
-                let dir = Directory::new(self.directory.clone(), path);
+                let dir = Directory::new(path);
                 let (req, _) = req.into_parts();
-                let x = (self.renderer)(&dir, &req);
+                let x = (self.renderer)(&self.filesystem, &dir, &req);
                 match x {
                     Ok(resp) => Either::Left(ok(resp)),
                     Err(e) => Either::Left(ok(ServiceResponse::from_err(e, req))),
@@ -573,7 +604,7 @@ impl Service for FilesService {
                 )))
             }
         } else {
-            match NamedFile::open(path) {
+            match (self.namedfile_open)(&self.filesystem, &path) {
                 Ok(mut named_file) => {
                     if let Some(ref mime_override) = self.mime_override {
                         let new_disposition =
